@@ -3,28 +3,21 @@ import config
 import telebot
 import psycopg2
 from telebot import types
-from telebot.storage import StateMemoryStorage
-from telebot.handler_backends import State, StatesGroup
 
 TOKEN = config.TOKEN
-state_storage = StateMemoryStorage()
-bot = telebot.TeleBot(TOKEN, state_storage=state_storage)
+bot = telebot.TeleBot(TOKEN)
 
-def get_db_connection():
-    return psycopg2.connect(**config.DB_CONFIG)
+# Временные хранилища для многошаговых операций
+user_temp_data = {}
+user_quiz_data = {}
 
 class Command:
     ADD_WORD = 'Добавить слово ➕'
     DELETE_WORD = 'Удалить слово🔙'
     NEXT = 'Дальше ⏭'
 
-class MyStates(StatesGroup):
-    target_word = State()
-    rus_word = State()
-    other_words = State()
-    add_english = State()
-    add_russian = State()
-    delete_word = State()
+def get_db_connection():
+    return psycopg2.connect(**config.DB_CONFIG)
 
 def register_user(user_id, username):
     connection = get_db_connection()
@@ -54,11 +47,12 @@ def get_quiz_words(user_id, count=4):
     connection = get_db_connection()
     cursor = connection.cursor()
     try:
+        # Берём только слова пользователя ИЛИ общие слова. Персональные слова других пользователей игнорируются.
         cursor.execute("""
             SELECT w.english, w.russian
             FROM words w
             LEFT JOIN user_words uw ON w.id_words = uw.word_id
-            WHERE uw.user_id IS NULL OR uw.user_id = %s
+            WHERE uw.user_id = %s OR w.is_common = TRUE
             ORDER BY RANDOM()
             LIMIT %s
         """, (user_id, count))
@@ -74,9 +68,9 @@ def get_user_words_from_db(user_id):
     try:
         cursor.execute(
             """SELECT w.english, w.russian
-            FROM user_words uw
-            JOIN words w ON uw.word_id = w.id_words
-            WHERE uw.user_id = %s""",
+               FROM user_words uw
+               JOIN words w ON uw.word_id = w.id_words
+               WHERE uw.user_id = %s""",
             (user_id,)
         )
         results = cursor.fetchall()
@@ -92,6 +86,7 @@ def add_user_word_to_db(user_id, english, russian):
         eng = english.strip().lower()
         rus = russian.strip().lower()
 
+        # 1. Проверяем, есть ли уже это слово у пользователя
         cursor.execute("""
             SELECT 1 FROM user_words uw
             JOIN words w ON uw.word_id = w.id_words
@@ -101,23 +96,24 @@ def add_user_word_to_db(user_id, english, russian):
         if cursor.fetchone():
             return "already_added"
 
+        # 2. Проверяем, есть ли слово в общих (is_common = TRUE)
         cursor.execute("""
             SELECT id_words FROM words
-            WHERE LOWER(english) = %s AND LOWER(russian) = %s
+            WHERE LOWER(english) = %s AND LOWER(russian) = %s AND is_common = TRUE
         """, (eng, rus))
         word_id_result = cursor.fetchone()
 
         if word_id_result:
+            # Слово общее: просто создаём связь, не трогая саму запись в words
             word_id = word_id_result[0]
             cursor.execute("""
                 INSERT INTO user_words (user_id, word_id)
-                SELECT %s, %s WHERE NOT EXISTS (
-                    SELECT 1 FROM user_words WHERE user_id = %s AND word_id = %s
-                )
-            """, (user_id, word_id, user_id, word_id))
+                VALUES (%s, %s) ON CONFLICT DO NOTHING
+            """, (user_id, word_id))
             connection.commit()
             return "common_word"
         else:
+            # Слова нет в общих: создаём новое персональное (is_common = FALSE по дефолту)
             cursor.execute(
                 "INSERT INTO words (english, russian) VALUES (%s, %s) RETURNING id_words",
                 (eng, rus)
@@ -156,15 +152,11 @@ def delete_user_word_from_db(user_id, english):
 def start_command(message):
     register_user(message.from_user.id, message.from_user.username)
     welcome_text = (
-        "Привет! Я - бот для изучения английских слов!\n "
-        "Доступные команды:\n "
-        "/start - Начать работу с ботом\n "
-        "/cards - Начать изучение слов\n\n "
-        "Что умеет этот бот:\n "
-        "• Показывает русское слово и варианты перевода на английский\n "
-        "• Позволяет добавлять свои слова для изучения\n "
-        "• Удаляет слова из вашего личного словаря\n\n "
-        "Нажмите /cards, чтобы начать изучение! "
+        "Привет! Я - бот для изучения английских слов!\n"
+        "Доступные команды:\n"
+        "/start - Начать работу с ботом\n"
+        "/cards - Начать изучение слов\n\n"
+        "Нажмите /cards, чтобы начать изучение!"
     )
     bot.send_message(message.chat.id, welcome_text)
 
@@ -187,7 +179,6 @@ def start_bot(message):
     markup = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
     buttons = [types.KeyboardButton(target['english'])] + [types.KeyboardButton(w) for w in options]
     random.shuffle(buttons)
-
     buttons.extend([
         types.KeyboardButton(Command.NEXT),
         types.KeyboardButton(Command.ADD_WORD),
@@ -200,10 +191,7 @@ def start_bot(message):
         f'Выбери правильный перевод для слова: <b>{target["russian"]}</b>',
         parse_mode='HTML', reply_markup=markup
     )
-    bot.set_state(message.from_user.id, MyStates.target_word, message.chat.id)
-    with bot.retrieve_data(message.from_user.id, message.chat.id) as data:
-        data['target_word'] = target['english']
-        data['rus_word'] = target['russian']
+    user_quiz_data[message.from_user.id] = target['english']
 
 @bot.message_handler(func=lambda message: message.text == Command.NEXT)
 def next_word(message):
@@ -212,38 +200,35 @@ def next_word(message):
 @bot.message_handler(func=lambda message: message.text == Command.ADD_WORD)
 def add_word_command(message):
     bot.send_message(message.chat.id, "Напишите слово на английском языке:")
-    bot.set_state(message.from_user.id, MyStates.add_english, message.chat.id)
+    bot.register_next_step_handler(message, add_english_step)
 
-@bot.message_handler(state=MyStates.add_english)
-def add_english_word(message):
-    with bot.retrieve_data(message.from_user.id, message.chat.id) as data:
-        data['new_english'] = message.text.strip()
+def add_english_step(message):
+    user_temp_data[message.from_user.id] = {'english': message.text.strip()}
     bot.send_message(message.chat.id, "Теперь напишите его перевод на русский:")
-    bot.set_state(message.from_user.id, MyStates.add_russian, message.chat.id)
+    bot.register_next_step_handler(message, add_russian_step)
 
-@bot.message_handler(state=MyStates.add_russian)
-def add_russian_word(message):
-    with bot.retrieve_data(message.from_user.id, message.chat.id) as data:
-        english_word = data.get('new_english', '')
-        russian_word = message.text.strip()
-        user_id = get_user_id(message.from_user.id)
+def add_russian_step(message):
+    user_id = get_user_id(message.from_user.id)
+    if not user_id:
+        bot.send_message(message.chat.id, "❌ Ошибка пользователя.")
+        return
 
-        if not user_id:
-            bot.send_message(message.chat.id, "❌ Ошибка пользователя.")
-            bot.delete_state(message.from_user.id, message.chat.id)
-            return
+    english_word = user_temp_data.get(message.from_user.id, {}).get('english', '')
+    russian_word = message.text.strip()
 
-        status = add_user_word_to_db(user_id, english_word, russian_word)
+    if message.from_user.id in user_temp_data:
+        del user_temp_data[message.from_user.id]
 
-        if status == "already_added":
-            bot.send_message(message.chat.id, f"ℹ️ Слово '{english_word}' - '{russian_word}' уже есть в вашем словаре.")
-        elif status == "common_word":
-            bot.send_message(message.chat.id, f"ℹ️ Такое слово уже есть в общем словаре. Я добавил его в ваш список.")
-        else:
-            bot.send_message(message.chat.id, f"✅ Слово '{english_word}' - '{russian_word}' успешно добавлено!")
+    status = add_user_word_to_db(user_id, english_word, russian_word)
 
-        bot.delete_state(message.from_user.id, message.chat.id)
-        start_bot(message)
+    if status == "already_added":
+        bot.send_message(message.chat.id, f"ℹ️ Слово '{english_word}' - '{russian_word}' уже есть в вашем словаре.")
+    elif status == "common_word":
+        bot.send_message(message.chat.id, f"ℹ️ Такое слово уже есть в общем словаре. Я добавил его в ваш список.")
+    else:
+        bot.send_message(message.chat.id, f"✅ Слово '{english_word}' - '{russian_word}' успешно добавлено!")
+
+    start_bot(message)
 
 @bot.message_handler(func=lambda message: message.text == Command.DELETE_WORD)
 def delete_word_command(message):
@@ -256,16 +241,14 @@ def delete_word_command(message):
                 markup.add(types.KeyboardButton(word['english']))
             markup.add(types.KeyboardButton("Отмена"))
             bot.send_message(message.chat.id, "Выберите слово для удаления:", reply_markup=markup)
-            bot.set_state(message.from_user.id, MyStates.delete_word, message.chat.id)
+            bot.register_next_step_handler(message, delete_word_step)
         else:
             bot.send_message(message.chat.id, "У вас нет добавленных слов для удаления.")
     else:
         bot.send_message(message.chat.id, "Ошибка при получении данных пользователя.")
 
-@bot.message_handler(state=MyStates.delete_word)
-def delete_word_process(message):
+def delete_word_step(message):
     if message.text == "Отмена":
-        bot.delete_state(message.from_user.id, message.chat.id)
         start_bot(message)
         return
 
@@ -275,21 +258,19 @@ def delete_word_process(message):
     else:
         bot.send_message(message.chat.id, f"❌ Не удалось удалить слово '{message.text}' или оно не найдено.")
 
-    bot.delete_state(message.from_user.id, message.chat.id)
     start_bot(message)
 
 @bot.message_handler(func=lambda message: True, content_types=['text'])
 def message_reply(message):
-    if bot.get_state(message.from_user.id, message.chat.id) == MyStates.target_word:
-        with bot.retrieve_data(message.from_user.id, message.chat.id) as data:
-            if 'target_word' in data:
-                target_word = data['target_word']
-                if message.text.strip().lower() == target_word.lower():
-                    bot.send_message(message.chat.id, '✅ Все правильно! Чтобы продолжить, нажмите кнопку "Дальше".')
-                else:
-                    bot.send_message(message.chat.id, '❌ Неправильно! Попробуйте еще раз!')
+    if message.from_user.id in user_quiz_data:
+        target_word = user_quiz_data[message.from_user.id]
+        if message.text.strip().lower() == target_word.lower():
+            bot.send_message(message.chat.id, '✅ Все правильно! Чтобы продолжить, нажмите кнопку "Дальше".')
+            del user_quiz_data[message.from_user.id]
+        else:
+            bot.send_message(message.chat.id, '❌ Неправильно! Попробуйте еще раз!')
 
 if __name__ == '__main__':
     print('Бот запущен...')
     print('Для завершения нажмите Ctrl+C')
-    bot.polling()
+    bot.polling(non_stop=True)
